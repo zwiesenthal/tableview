@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { BarChart3, Pin, Plus, Sparkles, Table2, TerminalSquare, X } from "lucide-react";
+import { BarChart3, PanelLeftOpen, Pin, Plus, Sparkles, Table2, TerminalSquare, X } from "lucide-react";
 import { useStore } from "./store";
 import type { TableRef, VizSpec } from "./types";
 import { Sidebar } from "./components/Sidebar";
@@ -124,9 +124,12 @@ export default function App() {
       {s.chatSettings.side === "left" && chat}
       {s.activeConnectionId ? (
         <>
-          <Sidebar />
+          <div className={`sidebar-wrap ${s.sidebarCollapsed ? "collapsed" : ""}`} inert={s.sidebarCollapsed}>
+            <Sidebar />
+          </div>
           <div className="main">
-            <div className="tabs" ref={tabsEl}>
+            <div className={`tabs ${s.sidebarCollapsed && !(s.chatOpen && s.chatSettings.side === "left") ? "clear-lights" : ""}`} ref={tabsEl}>
+              {s.sidebarCollapsed && <button className="icon-btn tabs-sidebar" title="Show sidebar" onClick={s.toggleSidebar}><PanelLeftOpen size={14} /></button>}
               {tabs.map((t) => (
                 <div key={t.id} className={`tab ${t.id === s.activeTabId ? "active" : ""} ${t.pinned ? "pinned" : ""}`} title={t.kind === "table" ? `${t.table.schema}.${t.table.name}` : t.title}
                   onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); if (!t.pinned) s.closeTab(t.id); } else if (e.button === 0) s.setActiveTab(t.id); }}

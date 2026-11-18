@@ -16,7 +16,16 @@
 .tabs .tabs-new { flex: none; align-self: center; margin-left: 4px; position: sticky; right: 4px; }
 .tabs .tabs-fill { flex: 1 0 24px; align-self: stretch; }
 
-/* Sidebar */
+/* Sidebar: collapses to the left and slides back open. */
+.sidebar-wrap { flex: none; width: 248px; overflow: hidden; transition: width .18s ease; }
+.sidebar-wrap.collapsed { width: 0; }
+.sidebar-wrap > .sidebar { height: 100%; }
+.titlebar-pad { display: flex; align-items: center; justify-content: flex-end; padding: 0 8px; }
+/* With the sidebar hidden the tab bar sits under the traffic lights. */
+.tabs.clear-lights { padding-left: 78px; }
+.tabs .tabs-sidebar { flex: none; align-self: center; margin: 0 4px; }
+.tabs { transition: padding-left .18s ease; }
+@media (prefers-reduced-motion: reduce) { .sidebar-wrap, .tabs { transition: none; } }
 .tree-item { cursor: pointer; }
 .tree-item.kbd:not(.active) { background: var(--bg-selected); }
 .tree-item > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, Eye, Plus, RefreshCw, Search, Settings, Sparkles, Table2, TerminalSquare, MessageSquarePlus } from "lucide-react";
+import { ChevronDown, ChevronRight, Eye, PanelLeftClose, Plus, RefreshCw, Search, Settings, Sparkles, Table2, TerminalSquare, MessageSquarePlus } from "lucide-react";
 import { activeConnection, ENV_COLORS, useStore } from "../store";
 import "../nav.css";
 
@@ -50,7 +50,9 @@ export function Sidebar() {
   };
   return (
     <div className="sidebar">
-      <div className="titlebar-pad" data-tauri-drag-region />
+      <div className="titlebar-pad" data-tauri-drag-region>
+        <button className="icon-btn" title="Hide sidebar" onClick={s.toggleSidebar}><PanelLeftClose size={14} /></button>
+      </div>
       <button className="sidebar-conn" title="Switch connection" onClick={() => s.closeConnection()}>
         <span className="env-dot" style={{ background: ENV_COLORS[conn.env] ?? ENV_COLORS.local }} />
         <span className="name">{conn.name}</span>

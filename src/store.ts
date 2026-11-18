@@ -60,6 +60,8 @@ interface State {
   updateReady: boolean;
   quickOpen: boolean;
   chatOpen: boolean;
+  sidebarCollapsed: boolean;
+  toggleSidebar(): void;
   chatSettings: ChatSettings;
   selectedTable: TableRef | null;
   prefs: Prefs;
@@ -101,6 +103,12 @@ export const useStore = create<State>((set, get) => ({
   updateReady: false,
   quickOpen: false,
   chatOpen: false,
+  sidebarCollapsed: localStorage.getItem("tv.sidebarCollapsed") === "1",
+  toggleSidebar() {
+    const sidebarCollapsed = !get().sidebarCollapsed;
+    localStorage.setItem("tv.sidebarCollapsed", sidebarCollapsed ? "1" : "0");
+    set({ sidebarCollapsed });
+  },
   chatSettings: { side: "right", width: 380, model: "", extra_instructions: "", claude_path: "" },
   selectedTable: null,
   prefs: DEFAULT_PREFS,
