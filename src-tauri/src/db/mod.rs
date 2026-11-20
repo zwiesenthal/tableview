@@ -12,7 +12,8 @@ use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::{
-    AssertSqlSafe, Column, Either, Executor, MySql, Postgres, SqlSafeStr, Sqlite, Statement,
+    AssertSqlSafe, Column, Either, Executor, MySql, Postgres, Row, SqlSafeStr, Sqlite,
+    Statement,
 };
 
 use crate::config::{ConnectionConfig, DbKind};
@@ -157,7 +158,12 @@ pub async fn connect(
                 .username(&cfg.user)
                 .database(&cfg.database)
                 .ssl_mode(ssl_pg(&cfg.ssl_mode))
-                .application_name("TableView");
+                .application_name("TableView")
+                // Pooler-safe (PgBouncer, Supabase, Neon): a transaction-mode pooler
+                // shares server sessions between clients, so sqlx's numbered
+                // statements (sqlx_s_1, …) collide with ones another client left
+                // there. TableView only uses unnamed statements; see `pg_query`.
+                .statement_cache_capacity(0);
             if let Some(p) = password {
                 o = o.password(p);
             }
@@ -166,9 +172,10 @@ pub async fn connect(
                 .acquire_timeout(timeout)
                 .connect_with(o)
                 .await?;
-            let v: String = sqlx::query_scalar("SELECT current_setting('server_version')")
+            let v: String = sqlx::raw_sql("SELECT current_setting('server_version')")
                 .fetch_one(&pool)
-                .await?;
+                .await?
+                .try_get(0)?;
             Ok((Pool::Pg(pool), format!("PostgreSQL {v}")))
         }
         DbKind::Mysql => {
@@ -265,9 +272,10 @@ impl Pool {
         Ok(match self {
             Pool::Pg(p) => {
                 let mut c = p.acquire().await?;
-                let id: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                let id: i32 = sqlx::raw_sql("SELECT pg_backend_pid()")
                     .fetch_one(&mut *c)
-                    .await?;
+                    .await?
+                    .try_get(0)?;
                 Session {
                     conn: Conn::Pg(c),
                     backend_id: Some(id as i64),
@@ -293,12 +301,13 @@ impl Pool {
     /// Ask the server to stop whatever the connection `backend_id` is running.
     pub async fn cancel(&self, backend_id: i64) -> anyhow::Result<bool> {
         match self {
-            Pool::Pg(p) => Ok(
-                sqlx::query_scalar::<_, bool>("SELECT pg_cancel_backend($1)")
-                    .bind(backend_id as i32)
-                    .fetch_one(p)
-                    .await?,
-            ),
+            Pool::Pg(p) => Ok(sqlx::raw_sql(AssertSqlSafe(format!(
+                "SELECT pg_cancel_backend({})",
+                backend_id as i32
+            )))
+            .fetch_one(p)
+            .await?
+            .try_get(0)?),
             Pool::My(p) => {
                 sqlx::raw_sql(AssertSqlSafe(format!("KILL QUERY {backend_id}")))
                     .execute(p)
@@ -343,7 +352,8 @@ macro_rules! drain {
                         // A row beyond the cap: the result really is truncated.
                         truncated = true;
                         truncated_at = Some(Instant::now());
-                        if let Some(f) = on_full.take() {
+                        #[allow(unused_mut)]
+                        if let Some(mut f) = on_full.take() {
                             f();
                         }
                         continue;
@@ -437,29 +447,36 @@ fn returns_rows(sql: &str) -> bool {
 }
 
 /// Column names for a statement that returned no rows, so an empty result still shows headers.
-async fn empty_columns(conn: &mut Conn, sql: &str) -> Vec<(String, String)> {
+pub(crate) async fn empty_columns(conn: &mut Conn, sql: &str) -> Vec<(String, String)> {
     if !returns_rows(sql) {
         return vec![];
     }
     let cols = |names: Vec<(String, String)>| names;
     match conn {
-        Conn::Pg(c) => match c
-            .prepare(AssertSqlSafe(sql.to_string()).into_sql_str())
-            .await
-        {
-            Ok(st) => cols(
-                st.columns()
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.name().to_string(),
-                            sqlx::TypeInfo::name(c.type_info()).to_string(),
-                        )
-                    })
-                    .collect(),
-            ),
-            Err(_) => vec![],
-        },
+        // Not a prepared statement: sqlx would name it, which breaks behind poolers.
+        // One row of NULLs from a subquery the planner never runs (WHERE false)
+        // carries the column names and types.
+        Conn::Pg(c) => {
+            let body = sql.trim().trim_end_matches(';');
+            let probe = format!(
+                "SELECT _tv.* FROM (SELECT 1) AS _tv_one LEFT JOIN \
+                 (SELECT * FROM (\n{body}\n) AS _tv_q WHERE false) AS _tv ON true"
+            );
+            match sqlx::raw_sql(AssertSqlSafe(probe)).fetch_optional(&mut **c).await {
+                Ok(Some(row)) => cols(
+                    row.columns()
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.name().to_string(),
+                                sqlx::TypeInfo::name(c.type_info()).to_string(),
+                            )
+                        })
+                        .collect(),
+                ),
+                _ => vec![],
+            }
+        }
         Conn::My(c) => match c
             .prepare(AssertSqlSafe(sql.to_string()).into_sql_str())
             .await
@@ -534,9 +551,8 @@ pub async fn run_script(
     finish(collected, started, fallback)
 }
 
-/// Runs one prepared statement with text binds. Prepared statements reject
-/// multiple statements on Postgres and MySQL.
-#[allow(deprecated)]
+/// Runs one prepared statement with text binds, outside a transaction.
+/// Prepared statements reject multiple statements on Postgres and MySQL.
 pub async fn run_prepared(
     conn: &mut Conn,
     sql: &str,
@@ -544,14 +560,65 @@ pub async fn run_prepared(
     limits: (usize, usize),
     on_full: impl FnOnce() + Send,
 ) -> anyhow::Result<Output> {
+    prepared(conn, sql, binds, limits, on_full, false).await
+}
+
+/// Like `run_prepared`, inside a transaction the caller opened with BEGIN.
+pub async fn run_prepared_in_tx(
+    conn: &mut Conn,
+    sql: &str,
+    binds: &[Option<String>],
+    limits: (usize, usize),
+    on_full: impl FnOnce() + Send,
+) -> anyhow::Result<Output> {
+    prepared(conn, sql, binds, limits, on_full, true).await
+}
+
+#[allow(deprecated)]
+async fn prepared(
+    conn: &mut Conn,
+    sql: &str,
+    binds: &[Option<String>],
+    limits: (usize, usize),
+    on_full: impl FnOnce() + Send,
+    in_tx: bool,
+) -> anyhow::Result<Output> {
     let started = Instant::now();
     let collected = match conn {
         Conn::Pg(c) => {
-            let mut q = sqlx::query::<Postgres>(AssertSqlSafe(sql.to_string()));
-            for b in binds {
-                q = q.bind(b.clone());
+            // Inside a transaction a failed statement aborts it, so a retry needs a savepoint.
+            let mut on_full = Some(on_full);
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                if in_tx {
+                    sqlx::raw_sql("SAVEPOINT tv_stmt").execute(&mut **c).await?;
+                }
+                let mut q = pg_query(sql);
+                for b in binds {
+                    q = q.bind(b.clone());
+                }
+                let res = drain!(q.fetch_many(&mut **c), PgDecoder, limits, || {
+                    if let Some(f) = on_full.take() {
+                        f()
+                    }
+                });
+                match res {
+                    Err(e) if attempt < 3 && pg_unnamed_lost(&e) => {
+                        if in_tx {
+                            sqlx::raw_sql("ROLLBACK TO SAVEPOINT tv_stmt").execute(&mut **c).await?;
+                        }
+                    }
+                    Ok(r) => {
+                        // An abandoned stream still has rows on the wire; the caller closes it.
+                        if in_tx && !r.3 {
+                            sqlx::raw_sql("RELEASE SAVEPOINT tv_stmt").execute(&mut **c).await?;
+                        }
+                        break r;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            drain!(q.fetch_many(&mut **c), PgDecoder, limits, on_full)?
         }
         Conn::My(c) => {
             let mut q = sqlx::query::<MySql>(AssertSqlSafe(sql.to_string()));
@@ -574,6 +641,26 @@ pub async fn run_prepared(
         vec![]
     };
     finish(collected, started, fallback)
+}
+
+/// A Postgres query sent as an unnamed prepared statement. sqlx names
+/// statements sqlx_s_1, sqlx_s_2, … per connection; behind a transaction-mode
+/// pooler the server session is shared, and a name another client already used
+/// fails with "prepared statement sqlx_s_1 already exists".
+fn pg_query(sql: &str) -> sqlx::query::Query<'static, Postgres, sqlx::postgres::PgArguments> {
+    sqlx::query::<Postgres>(AssertSqlSafe(sql.to_string())).persistent(false)
+}
+
+/// The unnamed statement was gone at Bind (SQLSTATE 26000). Nothing ran, so the
+/// query can be sent again. Two causes: sqlx looks up a custom column type
+/// (enum, domain) with a plain query between Parse and Bind, which discards the
+/// unnamed statement (the type is cached afterwards); or a transaction-mode
+/// pooler moved the client to another server session between the two.
+fn pg_unnamed_lost(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<sqlx::Error>()
+        .and_then(|e| e.as_database_error())
+        .and_then(|d| d.code())
+        .is_some_and(|c| c == "26000")
 }
 
 /// Runs a fixed control statement (BEGIN, SET, ROLLBACK) over the simple protocol.
@@ -604,11 +691,23 @@ impl Pool {
     async fn rows(&self, sql: &str, binds: &[&str]) -> anyhow::Result<Vec<Vec<Cell>>> {
         Ok(match self {
             Pool::Pg(p) => {
-                let mut q = sqlx::query::<Postgres>(AssertSqlSafe(sql.to_string()));
-                for b in binds {
-                    q = q.bind(b.to_string());
+                let mut attempt = 0;
+                loop {
+                    attempt += 1;
+                    let mut q = pg_query(sql);
+                    for b in binds {
+                        q = q.bind(b.to_string());
+                    }
+                    match q.fetch_all(p).await {
+                        Ok(rows) => break rows.iter().map(decode::pg_row).collect(),
+                        Err(e) => {
+                            let e = anyhow::Error::from(e);
+                            if attempt >= 3 || !pg_unnamed_lost(&e) {
+                                return Err(e);
+                            }
+                        }
+                    }
                 }
-                q.fetch_all(p).await?.iter().map(decode::pg_row).collect()
             }
             Pool::My(p) => {
                 let mut q = sqlx::query::<MySql>(AssertSqlSafe(sql.to_string()));

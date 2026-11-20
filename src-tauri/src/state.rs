@@ -601,7 +601,7 @@ impl AppState {
                 };
                 let res = tokio::time::timeout(
                     CLAUDE_TIMEOUT + Duration::from_secs(5),
-                    db::run_prepared(&mut s.conn, sql, &[], limits, on_full),
+                    db::run_prepared_in_tx(&mut s.conn, sql, &[], limits, on_full),
                 )
                 .await;
                 if res.is_err()

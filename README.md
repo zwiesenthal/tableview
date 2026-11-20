@@ -112,11 +112,11 @@ TableView builds from source on macOS:
 git clone https://github.com/zwiesenthal/tableview.git
 cd tableview
 npm install
-npm run tauri build -- --bundles app
+npm run app
 open src-tauri/target/release/bundle/macos/TableView.app
 ```
 
-You need Node 20.19+, Rust stable, and the Xcode Command Line Tools. Builds are ad-hoc signed. Set `APPLE_SIGNING_IDENTITY` to sign with your own certificate, which also stops macOS asking for Keychain access after each rebuild. Saved passwords live in the macOS Keychain, never in plain files.
+You need Node 20.19+, Rust stable, and the Xcode Command Line Tools. `npm run app` signs with a code-signing certificate from your login keychain when there is one (Developer ID, else Apple Development; a free Apple Development certificate comes with Xcode), and so do the updates TableView builds for itself. A stable signature means macOS asks for Keychain access once, not after every rebuild. Without a certificate the build is ad-hoc signed. Set `APPLE_SIGNING_IDENTITY`, or the signing identity in Settings, to pick one. Saved passwords live in the macOS Keychain, never in plain files.
 
 ## How it works
 

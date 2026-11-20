@@ -27,11 +27,11 @@ TABLEVIEW_DATA_DIR=/tmp/tableview-dev npm run tauri dev
 ## Build
 
 ```bash
-npm run tauri build -- --bundles app
+npm run app
 # src-tauri/target/release/bundle/macos/TableView.app
 ```
 
-The build is ad-hoc signed by default. To sign with your own identity, set `APPLE_SIGNING_IDENTITY` (for example `"Apple Development: you@example.com (TEAMID)"`) when you build. Do not commit it to `tauri.conf.json`.
+`npm run app` signs with a Developer ID or Apple Development certificate from your login keychain when it finds one, and otherwise ad-hoc. To choose the certificate, set `APPLE_SIGNING_IDENTITY` (for example `"Apple Development: you@example.com (TEAMID)"`) when you build. Do not commit it to `tauri.conf.json`.
 
 ## Checks
 

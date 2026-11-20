@@ -843,8 +843,15 @@ impl Feedback {
                 .args(["run", "tauri", "build", "--", "--bundles", "app"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            if !identity.trim().is_empty() {
-                build.env("APPLE_SIGNING_IDENTITY", identity.trim());
+            // Ad-hoc signatures change with every build, and macOS then asks for the
+            // login password before the new build may read saved passwords. A real
+            // certificate keeps the app's identity, so "Always Allow" sticks.
+            let identity = match identity.trim() {
+                "" => default_signing_identity().await,
+                id => Some(id.to_string()),
+            };
+            if let Some(identity) = identity {
+                build.env("APPLE_SIGNING_IDENTITY", identity);
             }
             let mut child = build.spawn()?;
             let mut err = BufReader::new(child.stderr.take().unwrap()).lines();
@@ -1020,7 +1027,7 @@ pub async fn install_build(state: &AppState) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod slug_tests {
-    use super::{can_push, github_slug};
+    use super::{can_push, github_slug, pick_identity};
 
     #[test]
     fn parses_github_remotes() {
@@ -1032,6 +1039,19 @@ mod slug_tests {
         assert_eq!(github_slug("ssh://git@github.com/zwiesenthal/tableview.git\n"), want);
         assert_eq!(github_slug("https://gitlab.com/a/b.git"), None);
         assert_eq!(github_slug("https://github.com/zwiesenthal"), None);
+    }
+
+    #[test]
+    fn picks_a_stable_signing_identity() {
+        let dev = "1111111111111111111111111111111111111111";
+        let id = "2222222222222222222222222222222222222222";
+        let listing = format!(
+            "  1) {dev} \"Apple Development: a@b.c (TEAM1)\"\n  2) {id} \"Developer ID Application: Zed (TEAM2)\"\n     2 valid identities found"
+        );
+        assert_eq!(pick_identity(&listing).as_deref(), Some(id));
+        let only_dev = format!("  1) {dev} \"Apple Development: a@b.c (TEAM1)\"\n");
+        assert_eq!(pick_identity(&only_dev).as_deref(), Some(dev));
+        assert_eq!(pick_identity("     0 valid identities found"), None);
     }
 
     #[test]
@@ -1079,6 +1099,38 @@ pub fn mark_start() {
 }
 
 /// Whether the build on disk finished before this process started, i.e. it's the one running.
+/// A code-signing identity in the login keychain to sign rebuilds with when
+/// none is configured: Developer ID first, then Apple Development. Returns its
+/// SHA-1, which stays unambiguous when two certificates share a name.
+async fn default_signing_identity() -> Option<String> {
+    if let Ok(id) = std::env::var("APPLE_SIGNING_IDENTITY")
+        && !id.trim().is_empty()
+    {
+        return Some(id);
+    }
+    let out = run("security", Path::new("/"), &["find-identity", "-v", "-p", "codesigning"])
+        .await
+        .ok()?;
+    pick_identity(&out)
+}
+
+fn pick_identity(listing: &str) -> Option<String> {
+    let ids: Vec<(&str, &str)> = listing
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.trim().splitn(3, ' ');
+            let _index = parts.next()?;
+            let sha = parts.next()?;
+            let name = parts.next()?.trim().trim_matches('"');
+            (sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())).then_some((sha, name))
+        })
+        .collect();
+    ["Developer ID Application:", "Apple Development:"]
+        .iter()
+        .find_map(|prefix| ids.iter().find(|(_, n)| n.starts_with(prefix)))
+        .map(|(sha, _)| sha.to_string())
+}
+
 fn running_latest(state: &AppState) -> bool {
     let (built, _) = bundles(state);
     std::fs::metadata(built.join("Contents/MacOS/tableview"))

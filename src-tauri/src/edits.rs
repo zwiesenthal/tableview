@@ -296,7 +296,8 @@ macro_rules! run_tx {
         let mut tx = $pool.begin().await?;
         let mut total = 0u64;
         for (i, s) in $stmts.iter().enumerate() {
-            let mut q = sqlx::query::<$db>(AssertSqlSafe(s.sql.clone()));
+            // Unnamed statements: named ones collide behind Postgres poolers.
+            let mut q = sqlx::query::<$db>(AssertSqlSafe(s.sql.clone())).persistent(false);
             for b in &s.binds {
                 q = q.bind(b.clone());
             }

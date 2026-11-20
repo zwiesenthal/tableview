@@ -466,7 +466,7 @@ async fn claude_queries_are_read_only() {
     let pool = st.pool("pg").await.unwrap();
     let mut s = pool.session().await.unwrap();
     db::exec_raw(&mut s.conn, "BEGIN READ ONLY").await.unwrap();
-    let w = db::run_prepared(
+    let w = db::run_prepared_in_tx(
         &mut s.conn,
         "WITH d AS (DELETE FROM orders WHERE id = 1 RETURNING id) SELECT * FROM d",
         &[],
@@ -1256,4 +1256,69 @@ async fn new_search_cancels_the_previous_scan() {
     st.run_editor_query("pg", "s", "DROP TABLE tv_scan", "d")
         .await
         .unwrap();
+}
+
+/// Behind a transaction-mode pooler (PgBouncer, Supabase, Neon) a server
+/// session is shared with other clients, so it can already hold statements
+/// named sqlx_s_1, sqlx_s_2, …; a client that names its own statements the same
+/// way fails with "prepared statement sqlx_s_1 already exists". This poisons
+/// every pooled connection with those names and then uses every Postgres path.
+#[tokio::test]
+async fn postgres_works_when_sessions_already_hold_sqlx_statements() {
+    if !enabled() {
+        return;
+    }
+    let st = state();
+    let pool = st.pool("pg").await.unwrap();
+    let db::Pool::Pg(pg) = &*pool else { panic!("pg pool") };
+    let mut held = vec![];
+    for _ in 0..8 {
+        held.push(pg.acquire().await.unwrap());
+    }
+    for c in held.iter_mut() {
+        // Connecting must not have left named statements behind either.
+        let n: i64 = sqlx::Row::try_get(
+            &sqlx::raw_sql("SELECT count(*) FROM pg_prepared_statements")
+                .fetch_one(&mut **c)
+                .await
+                .unwrap(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(n, 0, "connect left prepared statements");
+        let poison: String = (1..=40)
+            .map(|i| format!("PREPARE sqlx_s_{i} AS SELECT {i};"))
+            .collect();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(poison))
+            .execute(&mut **c)
+            .await
+            .unwrap();
+    }
+    drop(held);
+
+    pool.schema_tree().await.unwrap();
+    pool.describe("public", "orders").await.unwrap();
+    let opts = BrowseOptions {
+        supersede: None,
+        limit: 20,
+        offset: 0,
+        filters: vec![Filter { column: "status".into(), op: "=".into(), value: "paid".into() }],
+        order_by: None,
+    };
+    let page = st.browse("pg", "public", "orders", &opts).await.unwrap();
+    assert!(page.row_count > 0);
+    let searched = BrowseOptions { supersede: Some("tab".into()), ..opts.clone() };
+    st.browse("pg", "public", "orders", &searched).await.unwrap();
+    assert!(st.count("pg", "public", "orders", &opts.filters).await.unwrap() > 0);
+    let claude = st.run_claude_query("pg", "SELECT count(*) AS n FROM customers", 10).await.unwrap();
+    assert_eq!(claude.meta.row_count, 1);
+    let ran = st.run_editor_query("pg", "t1", "SELECT * FROM customers LIMIT 3", "q1").await.unwrap();
+    assert_eq!(ran.row_count, 3);
+    // Column names for an empty result come from a plain query, not a prepared statement.
+    let mut conn = pool.conn().await.unwrap();
+    let cols = db::empty_columns(&mut conn, "SELECT id, plan FROM customers WHERE false;").await;
+    let names: Vec<_> = cols.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["id", "plan"]);
+    drop(conn);
+    pool.session().await.unwrap();
 }
